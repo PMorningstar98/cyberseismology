@@ -1,0 +1,55 @@
+{
+ "dataset": {
+  "name": "Stratosphere IoT-23, CTU-IoT-Malware-Capture-1-1 (2018-05-09)",
+  "file": "2018-05-09-17-30-31-192.168.100.103-zeek-conn-log.labeled",
+  "url": "https://mcfp.felk.cvut.cz/publicDatasets/IoT-23-Dataset-v2/CTU-IoT-Malware-Capture-1-1/",
+  "bytes": 144270428,
+  "flows": 1008745,
+  "malicious": 539472,
+  "benign": 469275,
+  "malware_profile": "Mirai-like: 539464 PartOfAHorizontalPortScan (ports 23/2323/8080/9527), 8 C&C (port 2407, 1 contact each)",
+  "topology": "single infected host 192.168.100.103 = 98.3% of flows",
+  "out_of_order_fraction": 0.3579
+ },
+ "reference_pipeline": {
+  "eta_auc": 0.2808,
+  "valley_auto": 2.7,
+  "valley_auto_bimodal": true,
+  "valley_0.08": {
+   "retained_pct": 91.9,
+   "precision": 0.552,
+   "recall": 0.95,
+   "enrichment": 1.03
+  },
+  "m3_flow_auc": 0.5352,
+  "m3_host": {
+   "infected_median": 2.958,
+   "benign_median": 0.301
+  },
+  "b_gauge": "degenerate: windowed b~0.001-0.08, R2~0.45 (single-source constant-rate scan)"
+ },
+ "kql_simulation": {
+  "q1_auc_sorted": 0.2088,
+  "q1_value_agreement_vs_reference_sorted": "98.77% @1e-6 (max|diff|=4.7e-6); residual = float rounding",
+  "q1_decision_jaccard_valley_0.08": 0.9223,
+  "q3_m3max": {
+   "192.168.100.103": 2.98,
+   "192.168.100.1": 0.301
+  },
+  "q5b_fingerprintable_remoteips": "83 / 597106 (>=12 contacts); C&C IPs not fingerprintable (1 contact each)"
+ },
+ "ctu42_comparison": {
+  "eta_auc": 0.755,
+  "recall": 0.527,
+  "enrichment": 3.81
+ },
+ "findings": [
+  "F1: eta-declustering INVERTS under scan-dominated catalogs (AUC 0.21-0.28 vs 0.755): the attack IS the cluster; benign slow repeats land on the 'mainshock' side. Boundary condition of the method.",
+  "F2: M3 blast radius transfers perfectly at HOST level (2.98 vs 0.30 median) — it is a host-level instrument, not flow-level.",
+  "F3: b-gauge requires multi-source magnitude diversity; degenerates on single-source constant-rate scans.",
+  "F4: Q5b per-RemoteIP fingerprinting needs >=12-contact endpoints; inapplicable to single-contact scan/C&C infrastructure.",
+  "F5: KQL port is semantically faithful on the second environment (98.77% value identity vs sorted reference; residual = dt=0/tie float handling).",
+  "F6: Zeek conn.log is close-time ordered (35.8% out-of-order by ts); KQL's explicit order-by-Timestamp is more correct than file order.",
+  "F7: Inverted-eta (swarm detection, analog of earthquake swarms) is the correct instrument for scan morphology: AUC ~0.72-0.79 as cluster-density detector."
+ ]
+}

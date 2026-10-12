@@ -1,0 +1,87 @@
+{
+  "task1_declustering": {
+    "dataset": "CTU-42 capture20110810.binetflow (2,824,636 flows, 6.1h)",
+    "labels": {
+      "botnet": 40961,
+      "normal": 30387,
+      "background": 2753288
+    },
+    "method": "Zaliapin-style nearest-neighbor eta = dt * D^1.6, D in {1 same dstIP+dport, 2 same dstIP, 3 same /24, 4 same /16}, latest-in-class parent",
+    "bimodality": "modes log10 eta = -2.25 (clustered) and +1.08 (independent); valley at 0.08",
+    "valley_threshold": {
+      "log10_eta": 0.08,
+      "catalog_retained_pct": 13.9,
+      "botnet_recall_pct": 52.7,
+      "normal_retained_pct": 16.8,
+      "background_retained_pct": 13.3,
+      "botnet_enrichment": 3.81
+    },
+    "auc": {
+      "eta_independence": 0.755,
+      "per_minute_rate_zscore": 0.55,
+      "new_destination": 0.4
+    },
+    "base_rate_pct": 1.45,
+    "note": "eta outperforms both baselines; declustered residual = 7.2x volume reduction with 3.8x botnet enrichment"
+  },
+  "task2_pooled_gr": {
+    "magnitude_def": "m = log10(flow total bytes); b from OLS on log10 N(>=m) in window m in [2,4.5]",
+    "per_catalog": {
+      "radiation": {
+        "n": 432992,
+        "b": 1.069,
+        "R2": 0.958,
+        "note": "probe-population break at m~1.9"
+      },
+      "ctu42_all": {
+        "n": 2824636,
+        "b": 0.7,
+        "R2": 0.994
+      },
+      "ctu42_botnet": {
+        "n": 40961,
+        "b": 1.069,
+        "R2": 0.953
+      },
+      "bn44": {
+        "n": 39723,
+        "b": 0.594,
+        "R2": 0.822
+      },
+      "amos": {
+        "n": 1523,
+        "b": 0.393,
+        "R2": 0.871
+      },
+      "rms_rat": {
+        "n": 26,
+        "b": null,
+        "note": "too few flows; joined pooled tail only"
+      }
+    },
+    "pooled_raw": {
+      "n": 3298900,
+      "b": 0.7,
+      "R2": 0.993,
+      "note": "dominated by CTU-42 mass"
+    },
+    "pooled_median_normalized": {
+      "n": 3298900,
+      "b": 0.727,
+      "R2": 0.993
+    },
+    "mle_tail": {
+      "radiation": {
+        "alpha": 2.89,
+        "xmin_B": 550,
+        "KS": 0.137
+      },
+      "amos": {
+        "alpha": 1.56,
+        "xmin_B": 13770,
+        "KS": 0.099
+      }
+    },
+    "interpretation": "b is environment-dependent (0.39-1.07) like regional b-values; b~1.07 for scanning/background catalogs = tectonic-like; low b (0.39 AMOS) = large-event-dominated intrusion = stressed-system analogue"
+  }
+}

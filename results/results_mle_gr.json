@@ -1,0 +1,52 @@
+{
+  "method": "Aki (1965) MLE b = log10(e)/(mean(m)-Mc_eff), Mc_eff=Mc-dmag/2, dmag=0.1; Mc scanned for best Wiemer-Wyss goodness-of-fit R within tail m>=2.0",
+  "catalogs": {
+    "radiation": {
+      "Mc": 2.6,
+      "b_mle": 1.29,
+      "se": 0.012,
+      "n": 11243,
+      "R": 76.9,
+      "b_ols": 1.07
+    },
+    "amos": {
+      "Mc": 2.0,
+      "b_mle": 0.476,
+      "se": 0.016,
+      "n": 878,
+      "R": 77.2,
+      "b_ols": 0.39
+    },
+    "bn44": {
+      "Mc": 2.1,
+      "b_mle": 1.078,
+      "se": 0.012,
+      "n": 8401,
+      "R": 68.5,
+      "b_ols": 0.59
+    },
+    "ctu42_full": {
+      "Mc": 2.4,
+      "b_mle": 0.69,
+      "se": 0.001,
+      "n": 1477675,
+      "R": 92.5,
+      "b_ols": 0.7
+    },
+    "ctu42_botnet": {
+      "Mc": 2.9,
+      "b_mle": 0.604,
+      "se": 0.015,
+      "n": 1599,
+      "R": 85.6,
+      "b_ols": 1.07
+    }
+  },
+  "quantization_finding": {
+    "radiation": "50% of flows at m=1.60 (40-byte minimum packets = scanning probes) — delta spike below interaction window",
+    "bn44": "IQR 2.08-2.53 quantized flow sizes",
+    "amos": "mode 1.80 handshake quantization"
+  },
+  "verdict": "Estimator agreement where GR-clean (ctu42_full R=92.5: MLE 0.690 vs OLS 0.70). Estimator divergence where distributions are quantized/curved (botnet subset, bn44) — b-value in cyber is estimator-dependent; report MLE+GoF as primary, windowed OLS as cross-check.",
+  "date": "2026-10-12"
+}

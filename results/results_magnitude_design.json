@@ -1,0 +1,47 @@
+{
+  "task": "Severity-magnitude design space (Next Experiments item 2)",
+  "date": "2026-10-11",
+  "candidates": {
+    "M1_log_bytes": {
+      "def": "log10(flow bytes)",
+      "bath_amos": -3.07,
+      "bath_ctu42_median": -0.191,
+      "bath_ctu42_inverted_pct": 70.4,
+      "auc_botnet": 0.335,
+      "gr_radiation": {
+        "b": 1.24,
+        "R2": 0.975
+      },
+      "verdict": "REJECTED as primary magnitude: Bath-inverted at scale, weakest discriminator"
+    },
+    "M2_productivity": {
+      "def": "log10(1+descendants in eta parent tree)",
+      "bath_amos": 0.01,
+      "bath_ctu42_median": 0.079,
+      "bath_ctu42_inverted_pct": 0.0,
+      "auc_botnet": 0.321,
+      "gr_radiation": {
+        "b": 1.75,
+        "R2": 0.98
+      },
+      "verdict": "Sign-safe by construction but degenerate: latest-prior parent trees are chains, gap~0 mechanically; keep as second axis"
+    },
+    "M3_blast_radius": {
+      "def": "log10(1+distinct destinations touched by same source in 10-min bin)",
+      "bath_amos": 0.05,
+      "bath_ctu42_median": 0.05,
+      "bath_ctu42_inverted_pct": 0.0,
+      "auc_botnet": 0.847,
+      "gr_radiation": {
+        "b": 1.48,
+        "R2": 0.953
+      },
+      "verdict": "WINNER: primary magnitude. Operationally meaningful, best discriminator, GR-distributed"
+    }
+  },
+  "combined_eta_M3_auc": 0.856,
+  "bath_law_verdict": "Terrestrial Bath (gap~1.2) NOT reproduced under ANY candidate: network event trees are chains/stars, not deep ETAS hierarchies. Gap statistic becomes a topology diagnostic (0=chain/star, 1.2=ETAS hierarchy), not a law.",
+  "two_axis_proposal": "magnitude = (M3 blast radius [impact axis], M2 productivity [causal axis]); M1 demoted to size-law descriptor only",
+  "graph_duality": "dst-anchored eta = repetition structure (triage); src-anchored eta = actor causal chains (kill chains). dst-eta cannot see cross-destination cascades (AMOS IOC events scatter over 8+ dst-clusters).",
+  "amos_blast_timeline": "IOC destinations concentrated in cascade windows (t+0-120s: 17 IOC dsts; t+240-360s: 8), M3 does not spike for single-host cascades in 10-min bins (13 dsts vs 4-19 browsing) - M3 is a network-population magnitude"
+}
