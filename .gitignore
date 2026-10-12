@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*_triage.csv
+*_sources.csv
+*_report.json
+*.pcap
+*.binetflow
+.DS_Store

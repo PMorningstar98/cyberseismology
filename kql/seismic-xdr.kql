@@ -1,0 +1,346 @@
+// =============================================================================
+// SEISMIC-INTRUSION FRAMEWORK — Microsoft Defender XDR KQL PACK v1.0
+// Companion to: Seismic-Intrusion-Framework-Working-Document v3.1 (Sec. 4, 12)
+//               + seismic_pipeline.py v1.0 (reference implementation)
+//
+// Instruments implemented:
+//   Q0  Shared "Flows" CTE (save as a Function in Advanced Hunting)
+//   Q1  Eta (Zaliapin nearest-neighbor) triage queue          [doc Sec.12.1-12.4]
+//   Q2  Eta bimodality check / valley calibration             [doc Sec.12.2]
+//   Q3  M3 blast-radius magnitude per device per 10 min       [doc Sec.12.6]
+//   Q4  b-value gauge (Gutenberg-Richter slope per 30 min)    [doc Sec.12.5]
+//   Q5  Regime fingerprint per device (4-signature taxonomy)  [doc Sec.8]
+//   Q6  Combined eta+M3 score                                 [doc Sec.12.6]
+//   Q7  Near-real-time custom detection (M3 spike)
+//
+// IMPORTANT — Advanced Hunting service limits (plan around them):
+//   * 30-day max lookback, 10k result rows, 10-min query timeout, CPU quota.
+//   * The eta instrument (Q1) is the expensive one: it sorts and partitions.
+//     Scope it (<= 24h, one subnet / one device group / ActionType filter).
+//   * Q3/Q4/Q6/Q7 are summarize-only and scale to the full 30 days.
+//   * Kusto partition operator: use hint.strategy=native (legacy caps at
+//     64 distinct partition keys). If your AH tenant rejects it, scope the
+//     query to a single DeviceId/RemoteIP and use plain serialize+prev.
+// =============================================================================
+
+
+// ------------------------------------------------------------------ Q0: Flows
+// Save this as a function named "SeismicFlows" to reuse in Q1-Q6.
+// One row = one connection event (the XDR analog of one flow record).
+let Lookback = 24h;                    // scope down before widening
+let Flows = DeviceNetworkEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType in ("ConnectionSuccess", "ConnectionFailed", "ConnectionRequest")
+    | where isnotempty(RemoteIP)
+    | where RemoteIP matches regex @"^\d{1,3}(\.\d{1,3}){3}$"   // IPv4 only (hierarchy math)
+    // | where RemoteIPType == "Public"                         // uncomment: internet-facing only
+    // | where LocalIPType == "Private"                          // uncomment: outbound from endpoints
+    | extend DstLong = tolong(parse_ipv4(RemoteIP))
+    | extend Dst24   = floor(DstLong, 256)                   // same /24 key
+    | extend Dst16   = floor(DstLong, 65536)                 // same /16 key
+    | extend IpPortKey = strcat(RemoteIP, ":", RemotePort)      // D=1 class key
+    | project Timestamp, DeviceId, DeviceName, LocalIP, RemoteIP, RemotePort,
+              Protocol, ActionType, InitiatingProcessFileName, ReportId,
+              Dst24, Dst16, IpPortKey;
+Flows
+
+
+// ------------------------------------------------- Q1: eta triage queue
+// eta = dt_backward * D^1.6, D in {1 same IP+port, 2 same IP, 3 same /24, 4 same /16}.
+// dt_backward = seconds since the most recent prior event in that class.
+// Implementation: one partition+prev per class, then row-wise minimum.
+// HIGH eta = temporally independent event = mainshock candidate = top of queue.
+// Requires Q0 Flows CTE. Re-run of the Python reference on the same catalog
+// should reproduce ranking (small differences: AH timestamps are seconds-scale).
+// CALIBRATION NOTE (validated in simulation on the AMOS capture):
+// DeviceNetworkEvents direction-normalizes conversations (RemoteIP = external side),
+// which merges inbound+outbound into shared eta classes -> the eta distribution
+// shifts DOWN vs a unidirectional flow export (fallback valley 0.08 retained only
+// 7.5% instead of 14%). ALWAYS run Q2 first and set ValleyLogEta at YOUR valley.
+let Lookback = 24h;
+let DExp  = 1.6;
+let ValleyLogEta = 0.08;    // CTU-42 ground-truth valley; re-calibrate with Q2
+let Flows = DeviceNetworkEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType in ("ConnectionSuccess", "ConnectionFailed", "ConnectionRequest")
+    | where isnotempty(RemoteIP)
+    | where RemoteIP matches regex @"^\d{1,3}(\.\d{1,3}){3}$"
+    | extend DstLong = tolong(parse_ipv4(RemoteIP))
+    | extend Dst24   = floor(DstLong, 256)
+    | extend Dst16   = floor(DstLong, 65536)
+    | extend IpPortKey = strcat(RemoteIP, ":", RemotePort)
+    | extend RowId = new_guid()
+    | project RowId, Timestamp, DeviceId, DeviceName, LocalIP, RemoteIP, RemotePort,
+              Protocol, ActionType, InitiatingProcessFileName, ReportId, Dst24, Dst16, IpPortKey;
+let DtIpPort = Flows
+    | partition hint.strategy=native by IpPortKey (
+        order by Timestamp asc | serialize
+        | extend Dt1 = datetime_diff("millisecond", Timestamp, prev(Timestamp)) / 1000.0)
+    | project RowId, Dt1;
+let DtIp = Flows
+    | partition hint.strategy=native by RemoteIP (
+        order by Timestamp asc | serialize
+        | extend Dt2 = datetime_diff("millisecond", Timestamp, prev(Timestamp)) / 1000.0)
+    | project RowId, Dt2;
+let Dt24 = Flows
+    | partition hint.strategy=native by Dst24 (
+        order by Timestamp asc | serialize
+        | extend Dt3 = datetime_diff("millisecond", Timestamp, prev(Timestamp)) / 1000.0)
+    | project RowId, Dt3;
+let Dt16 = Flows
+    | partition hint.strategy=native by Dst16 (
+        order by Timestamp asc | serialize
+        | extend Dt4 = datetime_diff("millisecond", Timestamp, prev(Timestamp)) / 1000.0)
+    | project RowId, Dt4;
+Flows
+| join kind=leftouter DtIpPort on RowId
+| join kind=leftouter DtIp     on RowId
+| join kind=leftouter Dt24     on RowId
+| join kind=leftouter Dt16     on RowId
+| extend Eta1 = coalesce(Dt1, 999999.0) * 1.0,     // 1^1.6 ; null = no prior in class
+         Eta2 = coalesce(Dt2, 999999.0) * 3.0314,  // 2^1.6
+         Eta3 = coalesce(Dt3, 999999.0) * 5.7995,  // 3^1.6
+         Eta4 = coalesce(Dt4, 999999.0) * 9.1896   // 4^1.6
+| extend EtaMin = min_of(Eta1, Eta2, Eta3, Eta4)
+| where EtaMin < 999999.0                          // drop first-ever events per device
+| extend LogEta = log10(EtaMin)
+| extend Class  = iff(LogEta >= ValleyLogEta, "mainshock_candidate", "aftershock/background")
+| where Class == "mainshock_candidate"
+| project Timestamp, DeviceName, LocalIP, RemoteIP, RemotePort, Protocol,
+          InitiatingProcessFileName, LogEta, Class, ReportId, DeviceId
+| order by LogEta desc
+| take 200
+// Reading guide: top rows = flows belonging to NO recent repetition pattern.
+// In the AMOS validation this ranking put every post-infection C2 flow in
+// the top 100 of 1,515 (PIPELINE_DEMO_REPORT.md, Demo A).
+
+
+// ---------------------------------- Q2: eta bimodality check (calibrate valley)
+// Same pipeline as Q1 up to LogEta, then histogram. Run, eyeball the chart:
+// two modes with a valley between them = healthy catalog; set ValleyLogEta
+// at the valley. Single hump = not bimodal -> keep fallback 0.08.
+// (Replace the final "| where Class..." / projection of Q1 with:)
+//
+// | extend Bin = floor(LogEta * 10.0, 1.0) / 10.0
+// | summarize Events = count() by Bin
+// | order by Bin asc
+// | render columnchart with (title="log10 eta histogram — pick valley between modes")
+
+
+// -------------------------------- Q3: M3 blast radius per device per 10 min
+// M3 = log10(1 + distinct destinations per device per 10-min window).
+// Validated best severity axis: AUC 0.847 vs 0.335 for byte-volume (doc Sec.12.6).
+let Lookback = 24h;
+DeviceNetworkEvents
+| where Timestamp > ago(Lookback)
+| where ActionType in ("ConnectionSuccess", "ConnectionFailed", "ConnectionRequest")
+| where isnotempty(RemoteIP)
+| summarize DistinctDst = dcount(RemoteIP),            // dcount = HLL estimate; use
+            Events = count()                           // count_distinct(RemoteIP) if exact needed
+        by DeviceId, DeviceName, bin(Timestamp, 10m)
+| extend M3 = log10(1.0 + DistinctDst)
+| order by M3 desc
+// Threshold intuition from validation: M3 >= 2.0 (100 dst / 10 min) = infection-scale
+// blast radius (AMOS victim hit exactly 2.0). M3 <= 0.3 = single-destination host.
+
+
+// ------------------------- Q4: b-value gauge (per 30-min window)
+// Binned OLS of log10 N(>=m) = a - b*m on the M3 distribution of each window.
+// Validated property: stable baseline on quiet wire (0.188 +/- 0.036 / 7 days);
+// alarm on |b - baseline| > 2 sigma of YOUR environment's first-week baseline.
+let Lookback = 7d;
+let M3Rows = DeviceNetworkEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType in ("ConnectionSuccess", "ConnectionFailed", "ConnectionRequest")
+    | where isnotempty(RemoteIP)
+    | summarize DistinctDst = dcount(RemoteIP) by DeviceId, W10 = bin(Timestamp, 10m)
+    | extend M3 = log10(1.0 + DistinctDst)
+    | extend W = bin(W10, 30m);
+M3Rows
+| mv-expand M = dynamic([0.0, 0.3, 0.6, 0.9, 1.2, 1.5]) to typeof(double)   // magnitude bins
+                                            // include 0.0: validated — omitting the dense
+                                            // low-magnitude bin biases b upward (~+0.1-0.2)
+| where M3 >= M
+| summarize N = count() by W, M
+| where N > 0
+| extend Y = log10(N)
+| summarize n = count(), sx = sum(M), sy = sum(Y), sxy = sum(M * Y),
+            sxx = sum(M * M), syy = sum(Y * Y) by W
+| where n >= 3
+| extend b   = -(n * sxy - sx * sy) / (n * sxx - sx * sx)
+| extend R2  = pow((n * sxy - sx * sy), 2.0) / ((n * sxx - sx * sx) * (n * syy - sy * sy))
+| project WindowStart = W, b, R2
+| order by WindowStart asc
+| render timechart with (title="b-value gauge — alarm band = baseline +/- 2 sigma")
+// Drop = shift toward large events (spread/scan campaign). Rise = small-event dominated.
+// Reference points: background radiation 0.19; enterprise full catalog 0.70;
+// botnet-only 1.07 (doc Sec.12.5). YOUR baseline will differ — calibrate week 1.
+
+
+// ----------------------- Q5: regime fingerprint per device (4 signatures)
+// Per-device inter-arrival statistics over the lookback:
+//   CV         = stdev(dt)/avg(dt)                 (burstiness)
+//   DecayRatio = n_second_half / n_first_half      (Omori-decay proxy:
+//                < 1 = triggered sequence winding down = aftershock-like)
+//   Lag1       = lag-1 autocorrelation of dt       (memory)  [2nd partition pass]
+// Classification rules (identical thresholds to seismic_pipeline.py S4):
+//   CV < 0.5                          -> periodic_beacon
+//   DecayRatio < 0.6 and CV > 0.9     -> omori_decay   (the C2 signature from Demo A)
+//   CV > 1.3 and Lag1 > 0.15          -> bursty_cluster
+//   else                              -> poisson
+// XDR CAVEAT (validated in simulation): DeviceNetworkEvents merges both directions
+// of a conversation onto the endpoint's row, which dilutes Lag1 vs a unidirectional
+// flow export. periodic_beacon and omori_decay classifications are robust to this;
+// the bursty_cluster/poisson boundary shifts slightly. If precision there matters,
+// run the Python reference on a NetFlow/Zeek export (unidirectional records).
+// NOTE: per-device fingerprints only see YOUR fleet (DeviceId = monitored endpoint).
+// To fingerprint EXTERNAL hosts (where C2 servers live), use Q5b below — validated:
+// it classifies the AMOS C2 as omori_decay (DecayRatio 0.50, CV 3.66).
+let Lookback = 24h;
+let MinEvents = 8;
+let Events = DeviceNetworkEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType in ("ConnectionSuccess", "ConnectionFailed", "ConnectionRequest")
+    | where isnotempty(RemoteIP)
+    | project Timestamp, DeviceId, DeviceName;
+let Span = Events
+    | summarize nAll = count(), T0 = min(Timestamp), T1 = max(Timestamp) by DeviceId, DeviceName
+    | where nAll >= MinEvents
+    | extend Mid = T0 + (T1 - T0) / 2;
+let Rates = Events
+    | join kind=inner (Span | project DeviceId, Mid) on DeviceId
+    | extend Half = iff(Timestamp <= Mid, 1, 2)
+    | summarize n1 = countif(Half == 1), n2 = countif(Half == 2) by DeviceId
+    | extend DecayRatio = iff(n1 > 0, todouble(n2) / todouble(n1), 1.0);
+let IAT = Events
+    | where DeviceId in (Span | project DeviceId)
+    | partition hint.strategy=native by DeviceId (
+        order by Timestamp asc | serialize
+        | extend Dt = datetime_diff("millisecond", Timestamp, prev(Timestamp)) / 1000.0)
+    | where isnotnull(Dt) and Dt > 0;
+let CVTable = IAT
+    | summarize MeanDt = avg(Dt), SdDt = stdev(Dt) by DeviceId
+    | extend CV = SdDt / MeanDt;
+let Lag1Table = IAT
+    | partition hint.strategy=native by DeviceId (
+        order by Timestamp asc | serialize
+        | extend PrevDt = prev(Dt))
+    | where isnotnull(PrevDt)
+    | summarize n = count(), sx = sum(Dt), sy = sum(PrevDt), sxy = sum(Dt * PrevDt),
+                sxx = sum(Dt * Dt), syy = sum(PrevDt * PrevDt) by DeviceId
+    | extend Lag1 = (n * sxy - sx * sy) /
+                    sqrt((n * sxx - sx * sx) * (n * syy - sy * sy));
+Span
+| join kind=inner Rates on DeviceId
+| join kind=inner CVTable on DeviceId
+| join kind=leftouter Lag1Table on DeviceId
+| extend Lag1 = coalesce(Lag1, 0.0)
+| extend Regime = case(
+    CV < 0.5,                          "periodic_beacon",
+    DecayRatio < 0.6 and CV > 0.9,     "omori_decay",
+    CV > 1.3 and Lag1 > 0.15,          "bursty_cluster",
+                                       "poisson")
+| project DeviceName, DeviceId, nAll, Regime, CV = round(CV, 3),
+          DecayRatio = round(DecayRatio, 3), Lag1 = round(Lag1, 3),
+          MeanDt = round(MeanDt, 1)
+| order by Regime asc, nAll desc
+// Watchlist rule: any device flipping to omori_decay or periodic_beacon
+// (vs its own history) = investigate. Validated: the AMOS C2 endpoint
+// classified omori_decay from only 12 events (Demo A).
+
+
+// -------------------- Q5b: regime fingerprint per REMOTE host (external side)
+// Same machinery as Q5 but grouped by RemoteIP — this is where external C2s
+// appear in XDR, because they are never a DeviceId. Validated in simulation:
+// AMOS C2 (152.42.143.45) -> omori_decay from 24 direction-merged events.
+let Lookback = 24h;
+let MinEvents = 8;
+let Events = DeviceNetworkEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType in ("ConnectionSuccess", "ConnectionFailed", "ConnectionRequest")
+    | where RemoteIPType == "Public"
+    | project Timestamp, RemoteIP, DeviceName;
+let Span = Events
+    | summarize nAll = count(), T0 = min(Timestamp), T1 = max(Timestamp),
+                Devices = dcount(DeviceName) by RemoteIP
+    | where nAll >= MinEvents
+    | extend Mid = T0 + (T1 - T0) / 2;
+let Rates = Events
+    | join kind=inner (Span | project RemoteIP, Mid) on RemoteIP
+    | extend Half = iff(Timestamp <= Mid, 1, 2)
+    | summarize n1 = countif(Half == 1), n2 = countif(Half == 2) by RemoteIP
+    | extend DecayRatio = iff(n1 > 0, todouble(n2) / todouble(n1), 1.0);
+let CVTable = Events
+    | where RemoteIP in (Span | project RemoteIP)
+    | partition hint.strategy=native by RemoteIP (
+        order by Timestamp asc | serialize
+        | extend Dt = datetime_diff("millisecond", Timestamp, prev(Timestamp)) / 1000.0)
+    | where isnotnull(Dt) and Dt > 0
+    | summarize MeanDt = avg(Dt), SdDt = stdev(Dt) by RemoteIP
+    | extend CV = SdDt / MeanDt;
+Span
+| join kind=inner Rates on RemoteIP
+| join kind=inner CVTable on RemoteIP
+| extend Regime = case(
+    CV < 0.5,                          "periodic_beacon",
+    DecayRatio < 0.6 and CV > 0.9,     "omori_decay",
+    CV > 1.3,                          "bursty_cluster",
+                                       "poisson")
+| project RemoteIP, nAll, Devices, Regime, CV = round(CV, 3),
+          DecayRatio = round(DecayRatio, 3), MeanDt = round(MeanDt, 1)
+| order by Regime asc, nAll desc
+// Alert-worthy: a PUBLIC host with omori_decay touching few devices =
+// a triggered, winding-down interaction = classic post-exploitation C2 tail.
+
+
+// -------------------------------------- Q6: combined eta + M3 triage score
+// Validated combination: AUC 0.856 on CTU-42 ground truth (doc Sec.12.6).
+// Device-level daily risk: combine the device's most independent flow (max LogEta
+// among mainshock candidates) with its worst blast radius (max M3).
+// Setup: save Q1 (without final ordering/take) as function "SeismicEta".
+let Lookback = 24h;
+let ValleyLogEta = 0.08;
+let MaxM3 = DeviceNetworkEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType in ("ConnectionSuccess", "ConnectionFailed", "ConnectionRequest")
+    | where isnotempty(RemoteIP)
+    | summarize DistinctDst = dcount(RemoteIP) by DeviceId, bin(Timestamp, 10m)
+    | extend M3 = log10(1.0 + DistinctDst)
+    | summarize M3Max = max(M3) by DeviceId;
+SeismicEta
+| where LogEta >= ValleyLogEta
+| summarize MaxLogEta = max(LogEta), Mainshocks = count(),
+            TopDst = arg_max(LogEta, RemoteIP, RemotePort, Timestamp) by DeviceId, DeviceName
+| join kind=inner MaxM3 on DeviceId
+| extend Score = round(0.5 * min_of(MaxLogEta / 4.0, 1.0) + 0.5 * min_of(M3Max / 2.0, 1.0), 3)
+| project Score, DeviceName, DeviceId, MaxLogEta, M3Max, Mainshocks,
+          TopDst_RemoteIP = RemoteIP, TopDst_RemotePort = RemotePort, TopDst_Timestamp = Timestamp
+| order by Score desc
+| take 100
+
+
+// --------------------- Q7: near-real-time custom detection (M3 spike)
+// DeviceNetworkEvents supports NRT custom detections. This fires when any device
+// touches >= 50 distinct public IPs in 10 min (M3 >= 1.7) — the blast-radius wing
+// of the framework, cheap enough for NRT.
+// CUSTOM-DETECTION COMPLIANCE (required by the rule wizard):
+//   * Timestamp + ReportId + entity columns MUST survive -> arg_max keeps them.
+//   * NRT frequency additionally requires: ONE table, no joins/unions/externaldata,
+//     NO comments in the query body (strip them when pasting into the wizard),
+//     GA columns only.
+//   * Do NOT filter on Timestamp inside a rule (the service prefilters by lookback);
+//     use ingestion_time() > ago(1d) as an initial-scan guard while tuning.
+DeviceNetworkEvents
+| where ingestion_time() > ago(1d)                 // remove after tuning (initial-scan guard)
+| where ActionType in ("ConnectionSuccess", "ConnectionFailed", "ConnectionRequest")
+| where RemoteIPType == "Public"
+| summarize (Timestamp, ReportId) = arg_max(Timestamp, ReportId),
+            DistinctDst = dcount(RemoteIP),
+            Processes = make_set(InitiatingProcessFileName, 10)
+        by DeviceId, DeviceName, bin(Timestamp, 10m)
+| where DistinctDst >= 50
+| extend M3 = log10(1.0 + DistinctDst)
+| project Timestamp, ReportId, DeviceId, DeviceName, M3, DistinctDst, Processes
+// Wizard settings: Detection name "Seismic M3 blast-radius spike"; Frequency:
+// Continuous (NRT) if eligible, else Every hour (4h lookback); Severity Medium;
+// MITRE tactic: Command and Control / Discovery. Pair with Q1 during triage.
